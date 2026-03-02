@@ -1,16 +1,82 @@
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ─── In-memory lead store (persists as long as server is running) ────────────
-let leads = [];
+// ─── Configuration ──────────────────────────────────────────────────────────
+// Update these with your actual closer names
+const CLOSERS = [
+  "Closer 1", "Closer 2", "Closer 3", "Closer 4", "Closer 5",
+  "Closer 6", "Closer 7", "Closer 8", "Closer 9",
+];
+
+// ─── Data Persistence (JSON file) ───────────────────────────────────────────
+const DATA_DIR = path.join(__dirname, "data");
+const LEADS_FILE = path.join(DATA_DIR, "leads.json");
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function loadLeads() {
+  ensureDataDir();
+  try {
+    if (fs.existsSync(LEADS_FILE)) {
+      return JSON.parse(fs.readFileSync(LEADS_FILE, "utf8"));
+    }
+  } catch (err) {
+    console.error("[DATA] Failed to load leads:", err.message);
+  }
+  return [];
+}
+
+function saveLeads() {
+  ensureDataDir();
+  try {
+    fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
+  } catch (err) {
+    console.error("[DATA] Failed to save leads:", err.message);
+  }
+}
+
+function getDailySummaryPath() {
+  const today = new Date().toISOString().split("T")[0];
+  return path.join(DATA_DIR, "summary-" + today + ".json");
+}
+
+function loadDailySummary() {
+  const file = getDailySummaryPath();
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, "utf8"));
+    }
+  } catch (err) {
+    console.error("[DATA] Failed to load summary:", err.message);
+  }
+  return [];
+}
+
+function appendToSummary(entry) {
+  ensureDataDir();
+  const entries = loadDailySummary();
+  entries.push(entry);
+  try {
+    fs.writeFileSync(getDailySummaryPath(), JSON.stringify(entries, null, 2));
+  } catch (err) {
+    console.error("[DATA] Failed to save summary:", err.message);
+  }
+}
+
+// ─── Lead store (loaded from disk) ──────────────────────────────────────────
+let leads = loadLeads();
 let clients = []; // SSE subscribers
 
 // ─── SSE: broadcast to all connected dashboard clients ──────────────────────
 function broadcast(eventName, data) {
-  const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+  const payload = "event: " + eventName + "\ndata: " + JSON.stringify(data) + "\n\n";
   clients = clients.filter((res) => {
     try {
       res.write(payload);
@@ -21,14 +87,14 @@ function broadcast(eventName, data) {
   });
 }
 
-// ─── WEBHOOK: New Lead (GHL fires this when a contact is created) ────────────
+// ─── WEBHOOK: New Lead (GHL fires this when a contact is created) ───────────
 // GHL Workflow Action: "Send Webhook" → POST https://your-domain.railway.app/webhook/lead-in
 app.post("/webhook/lead-in", (req, res) => {
   const body = req.body;
 
   // Support both GHL native format and custom mapped fields
   const lead = {
-    id: body.contact_id || body.id || `lead_${Date.now()}`,
+    id: body.contact_id || body.id || "lead_" + Date.now(),
     firstName: body.first_name || body.firstName || body.contact?.firstName || "Unknown",
     lastName: body.last_name || body.lastName || body.contact?.lastName || "",
     phone: body.phone || body.phone_raw || body.contact?.phone || "--",
@@ -36,16 +102,18 @@ app.post("/webhook/lead-in", (req, res) => {
     arrivedAt: Date.now(),
     called: false,
     callTime: null,
+    setter: null,
   };
 
   // Prevent duplicate contact IDs
   const exists = leads.find((l) => l.id === lead.id);
   if (!exists) {
     leads.unshift(lead);
-    // Keep last 100 leads in memory
+    // Keep last 100 leads
     if (leads.length > 100) leads = leads.slice(0, 100);
+    saveLeads();
     broadcast("lead_in", lead);
-    console.log(`[LEAD IN] ${lead.firstName} ${lead.lastName} — ${lead.source}`);
+    console.log("[LEAD IN] " + lead.firstName + " " + lead.lastName + " — " + lead.source);
   }
 
   res.json({ ok: true, lead_id: lead.id });
@@ -62,8 +130,19 @@ app.post("/webhook/call-made", (req, res) => {
     lead.called = true;
     lead.callTime = Math.round((Date.now() - lead.arrivedAt) / 1000);
     lead.callStatus = body.call_status || body.status || "connected";
-    broadcast("call_made", { id: lead.id, callTime: lead.callTime, callStatus: lead.callStatus });
-    console.log(`[CALL MADE] ${lead.firstName} ${lead.lastName} — ${lead.callTime}s`);
+    lead.calledAt = Date.now();
+    saveLeads();
+    appendToSummary({
+      leadId: lead.id,
+      name: lead.firstName + " " + lead.lastName,
+      setter: lead.setter || "Unassigned",
+      timeToCall: lead.callTime,
+      calledAt: new Date().toISOString(),
+      arrivedAt: new Date(lead.arrivedAt).toISOString(),
+      source: lead.source,
+    });
+    broadcast("call_made", { id: lead.id, callTime: lead.callTime, callStatus: lead.callStatus, setter: lead.setter });
+    console.log("[CALL MADE] " + lead.firstName + " " + lead.lastName + " — " + lead.callTime + "s — " + (lead.setter || "Unassigned"));
   }
 
   res.json({ ok: true });
@@ -78,7 +157,7 @@ app.get("/events", (req, res) => {
   res.flushHeaders();
 
   // Send current state immediately on connect
-  res.write(`event: init\ndata: ${JSON.stringify({ leads })}\n\n`);
+  res.write("event: init\ndata: " + JSON.stringify({ leads, closers: CLOSERS }) + "\n\n");
 
   clients.push(res);
 
@@ -93,45 +172,77 @@ app.get("/events", (req, res) => {
   });
 });
 
-// ─── API: Get all leads (for page load fallback) ─────────────────────────────
+// ─── API: Get all leads (for page load fallback) ───────────────────────────
 app.get("/api/leads", (req, res) => {
-  res.json({ leads });
+  res.json({ leads, closers: CLOSERS });
 });
 
-// ─── API: Manual call mark (fallback if GHL auto-detect isn't wired yet) ────
+// ─── API: Assign setter/closer to lead ──────────────────────────────────────
+app.post("/api/assign-setter/:id", (req, res) => {
+  const lead = leads.find((l) => l.id === req.params.id);
+  if (lead) {
+    lead.setter = req.body.setter || null;
+    saveLeads();
+    broadcast("setter_assigned", { id: lead.id, setter: lead.setter });
+    console.log("[ASSIGN] " + lead.firstName + " " + lead.lastName + " → " + (lead.setter || "Unassigned"));
+  }
+  res.json({ ok: true });
+});
+
+// ─── API: Manual call mark (fallback if GHL auto-detect isn't wired yet) ───
 app.post("/api/mark-called/:id", (req, res) => {
   const lead = leads.find((l) => l.id === req.params.id);
   if (lead && !lead.called) {
     lead.called = true;
     lead.callTime = Math.round((Date.now() - lead.arrivedAt) / 1000);
-    broadcast("call_made", { id: lead.id, callTime: lead.callTime });
+    lead.calledAt = Date.now();
+    saveLeads();
+    appendToSummary({
+      leadId: lead.id,
+      name: lead.firstName + " " + lead.lastName,
+      setter: lead.setter || "Unassigned",
+      timeToCall: lead.callTime,
+      calledAt: new Date().toISOString(),
+      arrivedAt: new Date(lead.arrivedAt).toISOString(),
+      source: lead.source,
+    });
+    broadcast("call_made", { id: lead.id, callTime: lead.callTime, setter: lead.setter });
+    console.log("[CALL MADE] " + lead.firstName + " " + lead.lastName + " — " + lead.callTime + "s — " + (lead.setter || "Unassigned"));
   }
   res.json({ ok: true });
 });
 
-// ─── API: Clear all leads (admin) ────────────────────────────────────────────
+// ─── API: Daily summary ────────────────────────────────────────────────────
+app.get("/api/daily-summary", (req, res) => {
+  res.json({ entries: loadDailySummary() });
+});
+
+// ─── API: Clear all leads (admin) ──────────────────────────────────────────
 app.post("/api/clear", (req, res) => {
   leads = [];
+  saveLeads();
   broadcast("clear", {});
   res.json({ ok: true });
 });
 
-// ─── Serve the dashboard UI ──────────────────────────────────────────────────
+// ─── Serve the dashboard UI ────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send(getDashboardHTML());
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────
+// ─── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Speed to Lead running on port ${PORT}`);
-  console.log(`Webhook endpoints:`);
-  console.log(`  POST /webhook/lead-in`);
-  console.log(`  POST /webhook/call-made`);
+  console.log("Speed to Lead running on port " + PORT);
+  console.log("Webhook endpoints:");
+  console.log("  POST /webhook/lead-in");
+  console.log("  POST /webhook/call-made");
+  console.log("Data directory: " + DATA_DIR);
 });
 
-// ─── Dashboard HTML ──────────────────────────────────────────────────────────
+// ─── Dashboard HTML ────────────────────────────────────────────────────────
 function getDashboardHTML() {
+  const closersJSON = JSON.stringify(CLOSERS);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -162,11 +273,18 @@ function getDashboardHTML() {
   @keyframes pulse { 0%,100%{opacity:1;transform:scale(1);box-shadow:0 0 0 0 rgba(0,230,118,.4)}50%{opacity:.7;transform:scale(1.1);box-shadow:0 0 0 5px rgba(0,230,118,0)} }
   .conn-dot-disconnected { background: var(--red) !important; animation: none !important; }
 
-  .stats-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 32px; }
+  .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 32px; }
   .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; }
   .stat-label { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
   .stat-value { font-family: 'Bebas Neue', sans-serif; font-size: 32px; letter-spacing: 0.04em; line-height: 1; }
-  .green { color: var(--green); } .yellow { color: var(--yellow); } .red { color: var(--red); } .blue { color: var(--blue); }
+  .stat-sub { font-family: 'DM Mono', monospace; font-size: 9px; color: var(--muted); margin-top: 2px; }
+  .green { color: var(--green); } .yellow { color: var(--yellow); } .red { color: var(--red); } .blue { color: var(--blue); } .orange { color: var(--orange); }
+
+  /* Tabs */
+  .tabs-bar { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .tab-btn { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; padding: 10px 20px; cursor: pointer; transition: all 0.2s; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--green); border-bottom-color: var(--green); }
 
   .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
   .section-title { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.2em; color: var(--muted); text-transform: uppercase; }
@@ -184,8 +302,9 @@ function getDashboardHTML() {
   @keyframes cardFlash { 0%,100%{border-color:var(--red)}50%{border-color:rgba(255,23,68,.3)} }
 
   .lead-name { font-weight: 500; font-size: 15px; margin-bottom: 5px; }
-  .lead-meta { display: flex; align-items: center; gap: 12px; }
+  .lead-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .lead-phone { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); }
+  .lead-timestamp { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--muted); margin-top: 4px; }
   .source-pill { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; padding: 2px 8px; border-radius: 20px; border: 1px solid; }
   .source-facebook { color:#4fc3f7; border-color:#1a3a4a; background:rgba(79,195,247,.08); }
   .source-google { color:#a5d6a7; border-color:#1a3a22; background:rgba(165,214,167,.08); }
@@ -200,6 +319,12 @@ function getDashboardHTML() {
   .t-called{color:var(--muted);font-size:26px}
   @keyframes timerPulse{0%,100%{opacity:1}50%{opacity:.4}}
 
+  /* Setter dropdown */
+  .setter-select { background: var(--bg); border: 1px solid var(--border-bright); color: var(--text); font-family: 'DM Mono', monospace; font-size: 10px; padding: 6px 10px; border-radius: 5px; cursor: pointer; margin-bottom: 8px; width: 100%; max-width: 160px; }
+  .setter-select:focus { border-color: var(--blue); outline: none; }
+  .setter-select option { background: var(--surface); color: var(--text); }
+  .setter-assigned { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--blue); margin-bottom: 4px; text-align: center; }
+
   .btn-call { background: transparent; border: 1px solid var(--green); color: var(--green); font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .15em; text-transform: uppercase; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: all .2s; white-space: nowrap; }
   .btn-call:hover { background: var(--green); color: #000; }
   .btn-called { background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .15em; text-transform: uppercase; padding: 8px 16px; border-radius: 6px; cursor: default; white-space: nowrap; }
@@ -208,6 +333,34 @@ function getDashboardHTML() {
   .empty-state { text-align: center; padding: 80px 24px; color: var(--muted); }
   .empty-icon { font-size: 48px; margin-bottom: 16px; opacity: .3; }
   .empty-text { font-family: 'DM Mono', monospace; font-size: 11px; letter-spacing: .15em; text-transform: uppercase; }
+
+  /* Critical flash notification */
+  .critical-flash { position: fixed; top: 0; left: 0; right: 0; padding: 16px 24px; background: linear-gradient(90deg, #ff1744, #d50000); color: #fff; font-family: 'DM Mono', monospace; font-size: 13px; font-weight: 500; letter-spacing: 0.05em; text-align: center; z-index: 1000; transform: translateY(-100%); transition: transform 0.4s ease; box-shadow: 0 4px 24px rgba(255,23,68,0.4); }
+  .critical-flash.active { transform: translateY(0); }
+
+  /* Leaderboard */
+  .lb-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .lb-table { width: 100%; border-collapse: collapse; }
+  .lb-table th { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.15em; color: var(--muted); text-transform: uppercase; text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--bg); }
+  .lb-table td { font-size: 13px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .lb-table tr:last-child td { border-bottom: none; }
+  .lb-table tr:hover td { background: rgba(255,255,255,0.015); }
+  .lb-rank { font-family: 'Bebas Neue', sans-serif; font-size: 22px; width: 50px; }
+  .lb-rank-1 { color: #ffd740; }
+  .lb-rank-2 { color: #b0bec5; }
+  .lb-rank-3 { color: #ff8a65; }
+  .lb-name { font-weight: 500; }
+  .lb-avg { font-family: 'Bebas Neue', sans-serif; font-size: 24px; }
+  .lb-empty { text-align: center; padding: 40px; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 11px; letter-spacing: 0.1em; }
+
+  /* Call log */
+  .log-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .log-entry { padding: 12px 16px; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: 1fr auto auto auto; gap: 16px; align-items: center; }
+  .log-entry:last-child { border-bottom: none; }
+  .log-name { font-size: 13px; font-weight: 500; }
+  .log-name-sub { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--muted); }
+  .log-detail { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); }
+  .log-time { font-family: 'Bebas Neue', sans-serif; font-size: 22px; }
 
   .info-box { margin-top: 40px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }
   .info-title { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .2em; color: var(--muted); text-transform: uppercase; margin-bottom: 14px; }
@@ -228,10 +381,17 @@ function getDashboardHTML() {
   @media(max-width:700px){
     .stats-bar{grid-template-columns:repeat(2,1fr)}
     .lead-card{grid-template-columns:1fr;gap:12px}
+    .log-entry{grid-template-columns:1fr;gap:8px}
   }
 </style>
 </head>
 <body>
+
+<!-- Critical threshold flash notification -->
+<div id="critical-flash" class="critical-flash">
+  &#9888; CRITICAL: <span id="flash-name"></span> has been waiting over 5 minutes!
+</div>
+
 <div class="wrap">
   <header>
     <div>
@@ -249,13 +409,36 @@ function getDashboardHTML() {
     <div class="stat-card"><div class="stat-label">Avg Speed</div><div class="stat-value green" id="s-avg">--</div></div>
     <div class="stat-card"><div class="stat-label">Called</div><div class="stat-value green" id="s-called">0</div></div>
     <div class="stat-card"><div class="stat-label">Waiting</div><div class="stat-value red" id="s-waiting">0</div></div>
+    <div class="stat-card"><div class="stat-label">Top Closer</div><div class="stat-value yellow" id="s-top">--</div><div class="stat-sub" id="s-top-name">&nbsp;</div></div>
   </div>
 
-  <div class="section-head">
-    <span class="section-title">Active Leads</span>
-    <button class="btn-clear" onclick="clearAll()">Clear All</button>
+  <!-- Tab navigation -->
+  <div class="tabs-bar">
+    <button class="tab-btn active" data-tab="leads" onclick="switchTab('leads')">Active Leads</button>
+    <button class="tab-btn" data-tab="leaderboard" onclick="switchTab('leaderboard')">Leaderboard</button>
   </div>
-  <div class="leads-list" id="leads-list"></div>
+
+  <!-- Leads tab -->
+  <div id="tab-leads">
+    <div class="section-head">
+      <span class="section-title">Active Leads</span>
+      <button class="btn-clear" onclick="clearAll()">Clear All</button>
+    </div>
+    <div class="leads-list" id="leads-list"></div>
+  </div>
+
+  <!-- Leaderboard tab -->
+  <div id="tab-leaderboard" style="display:none">
+    <div class="section-head">
+      <span class="section-title">Closer Performance</span>
+    </div>
+    <div id="leaderboard"></div>
+
+    <div class="section-head" style="margin-top:28px">
+      <span class="section-title">Today's Call Log</span>
+    </div>
+    <div id="call-log"></div>
+  </div>
 
   <div class="info-box">
     <div class="info-title">GHL Webhook Endpoints</div>
@@ -277,49 +460,159 @@ function getDashboardHTML() {
       <button class="btn-sim gg" onclick="sim('Google')">+ Google</button>
       <button class="btn-sim" onclick="sim('Website')">+ Website</button>
       <button class="btn-sim" onclick="sim('Referral')">+ Referral</button>
-      <button class="btn-sim" style="margin-left:auto;border-color:#1a3a22;color:#a5d6a7" onclick="simCall()">📞 Sim Call</button>
+      <button class="btn-sim" style="margin-left:auto;border-color:#1a3a22;color:#a5d6a7" onclick="simCall()">&#128222; Sim Call</button>
     </div>
   </div>
 </div>
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
-let leads = [];
-let es;
+var leads = [];
+var CLOSERS = ${closersJSON};
+var es;
+var audioCtx;
+var criticalAlerted = {};
+var currentTab = 'leads';
 
 // Set domain in endpoint display
-const domain = window.location.origin;
+var domain = window.location.origin;
 document.getElementById('ep-lead').textContent = domain + '/webhook/lead-in';
 document.getElementById('ep-call').textContent = domain + '/webhook/call-made';
+
+// ── Audio ─────────────────────────────────────────────────────────────────
+function getAudioCtx() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+  }
+  return audioCtx;
+}
+
+function playNewLeadSound() {
+  var ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    var osc1 = ctx.createOscillator();
+    var gain1 = ctx.createGain();
+    osc1.connect(gain1);
+    gain1.connect(ctx.destination);
+    osc1.frequency.value = 880;
+    osc1.type = 'sine';
+    gain1.gain.setValueAtTime(0.25, ctx.currentTime);
+    gain1.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
+    osc1.start(ctx.currentTime);
+    osc1.stop(ctx.currentTime + 0.3);
+
+    var osc2 = ctx.createOscillator();
+    var gain2 = ctx.createGain();
+    osc2.connect(gain2);
+    gain2.connect(ctx.destination);
+    osc2.frequency.value = 1320;
+    osc2.type = 'sine';
+    gain2.gain.setValueAtTime(0.25, ctx.currentTime + 0.15);
+    gain2.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+    osc2.start(ctx.currentTime + 0.15);
+    osc2.stop(ctx.currentTime + 0.5);
+  } catch(e) {}
+}
+
+function playUrgentSound() {
+  var ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    for (var i = 0; i < 3; i++) {
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = 440;
+      osc.type = 'square';
+      var t = ctx.currentTime + i * 0.2;
+      gain.gain.setValueAtTime(0.15, t);
+      gain.gain.exponentialRampToValueAtTime(0.01, t + 0.12);
+      osc.start(t);
+      osc.stop(t + 0.12);
+    }
+  } catch(e) {}
+}
+
+// ── Critical Flash ─────────────────────────────────────────────────────────
+function showCriticalFlash(lead) {
+  var flash = document.getElementById('critical-flash');
+  document.getElementById('flash-name').textContent = lead.firstName + ' ' + lead.lastName;
+  flash.classList.add('active');
+  playUrgentSound();
+  setTimeout(function() { flash.classList.remove('active'); }, 4000);
+}
+
+// ── Tab Management ─────────────────────────────────────────────────────────
+function switchTab(tab) {
+  currentTab = tab;
+  var btns = document.querySelectorAll('.tab-btn');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].classList.toggle('active', btns[i].getAttribute('data-tab') === tab);
+  }
+  document.getElementById('tab-leads').style.display = tab === 'leads' ? '' : 'none';
+  document.getElementById('tab-leaderboard').style.display = tab === 'leaderboard' ? '' : 'none';
+  if (tab === 'leaderboard') {
+    renderLeaderboard();
+    fetchCallLog();
+  }
+}
 
 // ── SSE Connection ─────────────────────────────────────────────────────────
 function connect() {
   es = new EventSource('/events');
 
-  es.addEventListener('init', e => {
-    const data = JSON.parse(e.data);
+  es.addEventListener('init', function(e) {
+    var data = JSON.parse(e.data);
     leads = data.leads || [];
+    if (data.closers) CLOSERS = data.closers;
+    // Pre-populate critical set for leads already past 5 min
+    leads.forEach(function(l) {
+      if (!l.called && (Date.now() - l.arrivedAt) >= 300000) {
+        criticalAlerted[l.id] = true;
+      }
+    });
     render();
     setConn(true);
   });
 
-  es.addEventListener('lead_in', e => {
-    const lead = JSON.parse(e.data);
-    if (!leads.find(l => l.id === lead.id)) {
+  es.addEventListener('lead_in', function(e) {
+    var lead = JSON.parse(e.data);
+    if (!leads.find(function(l) { return l.id === lead.id; })) {
       leads.unshift(lead);
+      render();
+      playNewLeadSound();
+    }
+  });
+
+  es.addEventListener('call_made', function(e) {
+    var d = JSON.parse(e.data);
+    var lead = leads.find(function(l) { return l.id === d.id; });
+    if (lead) {
+      lead.called = true;
+      lead.callTime = d.callTime;
+      lead.setter = d.setter || lead.setter;
       render();
     }
   });
 
-  es.addEventListener('call_made', e => {
-    const { id, callTime, callStatus } = JSON.parse(e.data);
-    const lead = leads.find(l => l.id === id);
-    if (lead) { lead.called = true; lead.callTime = callTime; render(); }
+  es.addEventListener('setter_assigned', function(e) {
+    var d = JSON.parse(e.data);
+    var lead = leads.find(function(l) { return l.id === d.id; });
+    if (lead) {
+      lead.setter = d.setter;
+      render();
+    }
   });
 
-  es.addEventListener('clear', () => { leads = []; render(); });
+  es.addEventListener('clear', function() {
+    leads = [];
+    criticalAlerted = {};
+    render();
+  });
 
-  es.onerror = () => { setConn(false); setTimeout(connect, 3000); };
+  es.onerror = function() { setConn(false); setTimeout(connect, 3000); };
 }
 
 function setConn(ok) {
@@ -330,7 +623,7 @@ function setConn(ok) {
 // ── Helpers ────────────────────────────────────────────────────────────────
 function fmt(s) {
   if (s < 60) return '0:' + String(s).padStart(2,'0');
-  const m = Math.floor(s/60), sec = s%60;
+  var m = Math.floor(s/60), sec = s%60;
   if (m < 60) return m + ':' + String(sec).padStart(2,'0');
   return Math.floor(m/60) + 'h ' + (m%60) + 'm';
 }
@@ -350,46 +643,91 @@ function cStatus(s, called) {
 }
 function tLabel(s, called) {
   if (called) return 'Called';
-  if (s < 60) return 'On fire 🔥';
+  if (s < 60) return 'On fire';
   if (s < 180) return 'Good';
   if (s < 300) return 'Urgent';
   return 'CRITICAL';
 }
 function srcClass(src) {
-  const m = {Facebook:'source-facebook',Google:'source-google',Website:'source-website',Referral:'source-referral'};
+  var m = {Facebook:'source-facebook',Google:'source-google',Website:'source-website',Referral:'source-referral'};
   return m[src] || 'source-other';
+}
+function fmtTime(ts) {
+  var d = new Date(ts);
+  var h = d.getHours();
+  var min = String(d.getMinutes()).padStart(2, '0');
+  var ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return h + ':' + min + ' ' + ampm;
+}
+function fmtTimeFull(iso) {
+  var d = new Date(iso);
+  var h = d.getHours();
+  var min = String(d.getMinutes()).padStart(2, '0');
+  var sec = String(d.getSeconds()).padStart(2, '0');
+  var ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return h + ':' + min + ':' + sec + ' ' + ampm;
+}
+
+function makeCloserOptions(selected) {
+  var html = '<option value="">Assign closer...</option>';
+  for (var i = 0; i < CLOSERS.length; i++) {
+    html += '<option value="' + CLOSERS[i] + '"' + (CLOSERS[i] === selected ? ' selected' : '') + '>' + CLOSERS[i] + '</option>';
+  }
+  return html;
+}
+
+// ── Tab Title Badge ────────────────────────────────────────────────────────
+function updateTabTitle() {
+  var waiting = 0;
+  for (var i = 0; i < leads.length; i++) { if (!leads[i].called) waiting++; }
+  document.title = waiting > 0 ? '(' + waiting + ') Speed to Lead — RTP' : 'Speed to Lead — RTP';
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
 function render() {
-  const list = document.getElementById('leads-list');
+  var list = document.getElementById('leads-list');
   if (!leads.length) {
-    list.innerHTML = '<div class="empty-state"><div class="empty-icon">📡</div><div class="empty-text">Waiting for incoming leads</div></div>';
-    updateStats(); return;
+    list.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128225;</div><div class="empty-text">Waiting for incoming leads</div></div>';
+    updateStats(); updateTabTitle(); return;
   }
-  list.innerHTML = leads.map(lead => {
-    const el = lead.called ? lead.callTime : Math.round((Date.now() - lead.arrivedAt) / 1000);
-    const btn = lead.called
-      ? '<div class="btn-called">✓ Called</div><div class="call-time-result">' + fmt(lead.callTime) + '</div>'
-      : '<button class="btn-call" onclick="manualCall(\\'' + lead.id + '\\')">Mark Called</button>';
+  list.innerHTML = leads.map(function(lead) {
+    var el = lead.called ? lead.callTime : Math.round((Date.now() - lead.arrivedAt) / 1000);
+    var actionCol = '';
+    if (lead.called) {
+      actionCol = (lead.setter ? '<div class="setter-assigned">' + lead.setter + '</div>' : '') +
+        '<div class="btn-called">&#10003; Called</div>' +
+        '<div class="call-time-result">' + fmt(lead.callTime) + '</div>';
+    } else {
+      actionCol = '<select class="setter-select" onchange="assignSetter(\\'' + lead.id + '\\', this.value)">' + makeCloserOptions(lead.setter) + '</select>' +
+        '<button class="btn-call" onclick="manualCall(\\'' + lead.id + '\\')">Mark Called</button>';
+    }
     return '<div class="lead-card ' + cStatus(el, lead.called) + '" id="c-' + lead.id + '">' +
       '<div><div class="lead-name">' + lead.firstName + ' ' + lead.lastName + '</div>' +
       '<div class="lead-meta"><span class="lead-phone">' + lead.phone + '</span>' +
-      '<span class="source-pill ' + srcClass(lead.source) + '">' + lead.source + '</span></div></div>' +
+      '<span class="source-pill ' + srcClass(lead.source) + '">' + lead.source + '</span></div>' +
+      '<div class="lead-timestamp">Arrived ' + fmtTime(lead.arrivedAt) + '</div></div>' +
       '<div><div class="timer-display ' + tClass(el, lead.called) + '" id="t-' + lead.id + '">' + fmt(el) + '</div>' +
       '<div class="timer-label" id="tl-' + lead.id + '">' + tLabel(el, lead.called) + '</div></div>' +
-      '<div>' + btn + '</div></div>';
+      '<div>' + actionCol + '</div></div>';
   }).join('');
   updateStats();
+  updateTabTitle();
 }
 
 function updateTimers() {
-  leads.forEach(lead => {
+  leads.forEach(function(lead) {
     if (lead.called) return;
-    const el = Math.round((Date.now() - lead.arrivedAt) / 1000);
-    const te = document.getElementById('t-' + lead.id);
-    const tle = document.getElementById('tl-' + lead.id);
-    const ce = document.getElementById('c-' + lead.id);
+    var el = Math.round((Date.now() - lead.arrivedAt) / 1000);
+    // Check critical threshold (5 minutes)
+    if (el >= 300 && !criticalAlerted[lead.id]) {
+      criticalAlerted[lead.id] = true;
+      showCriticalFlash(lead);
+    }
+    var te = document.getElementById('t-' + lead.id);
+    var tle = document.getElementById('tl-' + lead.id);
+    var ce = document.getElementById('c-' + lead.id);
     if (!te) return;
     te.textContent = fmt(el);
     te.className = 'timer-display ' + tClass(el, false);
@@ -397,23 +735,149 @@ function updateTimers() {
     ce.className = 'lead-card ' + cStatus(el, false);
   });
   updateStats();
+  updateTabTitle();
 }
 
 function updateStats() {
-  const called = leads.filter(l => l.called);
-  const waiting = leads.filter(l => !l.called);
+  var called = [];
+  var waiting = [];
+  for (var i = 0; i < leads.length; i++) {
+    if (leads[i].called) called.push(leads[i]);
+    else waiting.push(leads[i]);
+  }
   document.getElementById('s-total').textContent = leads.length;
   document.getElementById('s-called').textContent = called.length;
   document.getElementById('s-waiting').textContent = waiting.length;
   if (called.length) {
-    const avg = Math.round(called.reduce((s,l) => s + l.callTime, 0) / called.length);
+    var avg = Math.round(called.reduce(function(s,l) { return s + l.callTime; }, 0) / called.length);
     document.getElementById('s-avg').textContent = fmt(avg);
   } else {
     document.getElementById('s-avg').textContent = '--';
   }
+
+  // Top closer
+  var closerStats = {};
+  for (var i = 0; i < leads.length; i++) {
+    var l = leads[i];
+    if (l.called && l.setter) {
+      if (!closerStats[l.setter]) closerStats[l.setter] = { total: 0, count: 0 };
+      closerStats[l.setter].total += l.callTime;
+      closerStats[l.setter].count++;
+    }
+  }
+  var bestName = null, bestAvg = Infinity;
+  for (var name in closerStats) {
+    var a = closerStats[name].total / closerStats[name].count;
+    if (a < bestAvg) { bestAvg = a; bestName = name; }
+  }
+  if (bestName) {
+    document.getElementById('s-top').textContent = fmt(Math.round(bestAvg));
+    document.getElementById('s-top-name').textContent = bestName;
+  } else {
+    document.getElementById('s-top').textContent = '--';
+    document.getElementById('s-top-name').innerHTML = '&nbsp;';
+  }
+}
+
+// ── Leaderboard ────────────────────────────────────────────────────────────
+function renderLeaderboard() {
+  var closerStats = {};
+  for (var i = 0; i < CLOSERS.length; i++) {
+    closerStats[CLOSERS[i]] = { calls: 0, totalTime: 0, best: Infinity, assigned: 0 };
+  }
+  for (var i = 0; i < leads.length; i++) {
+    var l = leads[i];
+    if (l.setter && closerStats[l.setter]) {
+      closerStats[l.setter].assigned++;
+      if (l.called) {
+        closerStats[l.setter].calls++;
+        closerStats[l.setter].totalTime += l.callTime;
+        if (l.callTime < closerStats[l.setter].best) closerStats[l.setter].best = l.callTime;
+      }
+    }
+  }
+
+  var ranked = [];
+  for (var i = 0; i < CLOSERS.length; i++) {
+    var s = closerStats[CLOSERS[i]];
+    if (s.calls > 0) {
+      ranked.push({ name: CLOSERS[i], calls: s.calls, avg: Math.round(s.totalTime / s.calls), best: s.best, assigned: s.assigned });
+    }
+  }
+  ranked.sort(function(a, b) { return a.avg - b.avg; });
+
+  var inactive = [];
+  for (var i = 0; i < CLOSERS.length; i++) {
+    if (closerStats[CLOSERS[i]].calls === 0) {
+      inactive.push({ name: CLOSERS[i], assigned: closerStats[CLOSERS[i]].assigned });
+    }
+  }
+
+  var el = document.getElementById('leaderboard');
+  if (!ranked.length && !inactive.length) {
+    el.innerHTML = '<div class="lb-wrap"><div class="lb-empty">No closer data yet. Assign closers to leads and mark them as called.</div></div>';
+    return;
+  }
+
+  var html = '<div class="lb-wrap"><table class="lb-table"><thead><tr>' +
+    '<th>Rank</th><th>Closer</th><th>Calls</th><th>Avg Speed</th><th>Best</th>' +
+    '</tr></thead><tbody>';
+
+  for (var i = 0; i < ranked.length; i++) {
+    var r = ranked[i];
+    var rankClass = i < 3 ? ' lb-rank-' + (i+1) : '';
+    var avgColor = r.avg < 60 ? 'green' : r.avg < 180 ? 'yellow' : r.avg < 300 ? 'orange' : 'red';
+    html += '<tr><td class="lb-rank' + rankClass + '">#' + (i+1) + '</td>' +
+      '<td class="lb-name">' + r.name + '</td>' +
+      '<td>' + r.calls + '</td>' +
+      '<td class="lb-avg ' + avgColor + '">' + fmt(r.avg) + '</td>' +
+      '<td>' + fmt(r.best) + '</td></tr>';
+  }
+
+  for (var i = 0; i < inactive.length; i++) {
+    html += '<tr style="opacity:0.4"><td class="lb-rank">—</td>' +
+      '<td class="lb-name">' + inactive[i].name + '</td>' +
+      '<td>' + inactive[i].assigned + ' assigned</td>' +
+      '<td class="lb-avg">--</td><td>--</td></tr>';
+  }
+
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+// ── Call Log ───────────────────────────────────────────────────────────────
+function fetchCallLog() {
+  fetch('/api/daily-summary').then(function(r) { return r.json(); }).then(function(data) {
+    var entries = data.entries || [];
+    var el = document.getElementById('call-log');
+    if (!entries.length) {
+      el.innerHTML = '<div class="lb-wrap"><div class="lb-empty">No calls logged today.</div></div>';
+      return;
+    }
+    var html = '<div class="log-wrap">';
+    for (var i = entries.length - 1; i >= 0; i--) {
+      var e = entries[i];
+      var timeColor = e.timeToCall < 60 ? 'green' : e.timeToCall < 180 ? 'yellow' : e.timeToCall < 300 ? 'orange' : 'red';
+      html += '<div class="log-entry">' +
+        '<div><div class="log-name">' + e.name + '</div><div class="log-name-sub">' + (e.source || '') + '</div></div>' +
+        '<div class="log-detail">' + (e.setter || 'Unassigned') + '</div>' +
+        '<div class="log-detail">' + fmtTimeFull(e.calledAt) + '</div>' +
+        '<div class="log-time ' + timeColor + '">' + fmt(e.timeToCall) + '</div></div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(function() {});
 }
 
 // ── Actions ────────────────────────────────────────────────────────────────
+function assignSetter(id, setter) {
+  fetch('/api/assign-setter/' + id, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ setter: setter })
+  });
+}
+
 function manualCall(id) {
   fetch('/api/mark-called/' + id, { method: 'POST' });
 }
@@ -423,28 +887,28 @@ function clearAll() {
 }
 
 function copyEp(id) {
-  const el = document.getElementById(id);
-  navigator.clipboard.writeText(el.textContent).then(() => {
-    const btn = el.nextElementSibling.nextElementSibling;
+  var el = document.getElementById(id);
+  navigator.clipboard.writeText(el.textContent).then(function() {
+    var btn = el.nextElementSibling.nextElementSibling;
     btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = 'Copy', 1500);
+    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
   });
 }
 
 // ── Simulate (dev only) ────────────────────────────────────────────────────
-const NAMES = [['James','Wilson'],['Maria','Garcia'],['David','Chen'],['Sarah','Johnson'],['Mike','Torres'],['Lisa','Patel']];
-const PHONES = ['+14015550101','+14015550202','+15085550303','+18605550404'];
-let si = 0;
+var NAMES = [['James','Wilson'],['Maria','Garcia'],['David','Chen'],['Sarah','Johnson'],['Mike','Torres'],['Lisa','Patel']];
+var PHONES = ['+14015550101','+14015550202','+15085550303','+18605550404'];
+var si = 0;
 function sim(source) {
-  const [fn, ln] = NAMES[si++ % NAMES.length];
+  var pair = NAMES[si++ % NAMES.length];
   fetch('/webhook/lead-in', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ contact_id: 'sim_'+Date.now(), first_name:fn, last_name:ln, phone:PHONES[Math.floor(Math.random()*PHONES.length)], source })
+    body: JSON.stringify({ contact_id: 'sim_'+Date.now(), first_name:pair[0], last_name:pair[1], phone:PHONES[Math.floor(Math.random()*PHONES.length)], source: source })
   });
 }
 function simCall() {
-  const pending = leads.filter(l => !l.called);
+  var pending = leads.filter(function(l) { return !l.called; });
   if (!pending.length) { alert('No pending leads.'); return; }
   fetch('/webhook/call-made', {
     method:'POST',
