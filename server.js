@@ -70,6 +70,31 @@ function appendToSummary(entry) {
   }
 }
 
+// ─── Outbound Call Counter ──────────────────────────────────────────────────
+function getOutboundCountPath() {
+  const today = new Date().toISOString().split("T")[0];
+  return path.join(DATA_DIR, "outbound-" + today + ".json");
+}
+
+function loadOutboundCount() {
+  const file = getOutboundCountPath();
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, "utf8")).count || 0;
+    }
+  } catch (err) {}
+  return 0;
+}
+
+function incrementOutboundCount() {
+  ensureDataDir();
+  const count = loadOutboundCount() + 1;
+  try {
+    fs.writeFileSync(getOutboundCountPath(), JSON.stringify({ count }));
+  } catch (err) {}
+  return count;
+}
+
 // ─── Lead store (loaded from disk) ──────────────────────────────────────────
 let leads = loadLeads();
 let clients = []; // SSE subscribers
@@ -88,14 +113,12 @@ function broadcast(eventName, data) {
 }
 
 // ─── WEBHOOK: New Lead (GHL fires this when a contact is created) ───────────
-// GHL Workflow Action: "Send Webhook" → POST https://your-domain.railway.app/webhook/lead-in
 app.post("/webhook/lead-in", (req, res) => {
   const body = req.body;
 
-  // Support both GHL native format and custom mapped fields
   const lead = {
     id: body.contact_id || body.id || "lead_" + Date.now(),
-    firstName: body.first_name || body.firstName || body.contact?.firstName || "Unknown",
+    firstName: body.first_name || body.firstName || body.contact?.firstName || "New Lead",
     lastName: body.last_name || body.lastName || body.contact?.lastName || "",
     phone: body.phone || body.phone_raw || body.contact?.phone || "--",
     source: body.source || body.lead_source || body.attributionSource?.medium || "Other",
@@ -105,11 +128,9 @@ app.post("/webhook/lead-in", (req, res) => {
     setter: null,
   };
 
-  // Prevent duplicate contact IDs
   const exists = leads.find((l) => l.id === lead.id);
   if (!exists) {
     leads.unshift(lead);
-    // Keep last 100 leads
     if (leads.length > 100) leads = leads.slice(0, 100);
     saveLeads();
     broadcast("lead_in", lead);
@@ -120,8 +141,11 @@ app.post("/webhook/lead-in", (req, res) => {
 });
 
 // ─── WEBHOOK: Call Made (GHL fires this when an outbound call is placed) ────
-// GHL Workflow Trigger: "Call Status" → POST https://your-domain.railway.app/webhook/call-made
 app.post("/webhook/call-made", (req, res) => {
+  // Always count every outbound call
+  const outboundCount = incrementOutboundCount();
+  broadcast("outbound_update", { count: outboundCount });
+
   const body = req.body;
   const contactId = body.contact_id || body.id || body.contactId;
 
@@ -156,12 +180,10 @@ app.get("/events", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.flushHeaders();
 
-  // Send current state immediately on connect
-  res.write("event: init\ndata: " + JSON.stringify({ leads, closers: CLOSERS }) + "\n\n");
+  res.write("event: init\ndata: " + JSON.stringify({ leads, closers: CLOSERS, outboundCount: loadOutboundCount() }) + "\n\n");
 
   clients.push(res);
 
-  // Heartbeat every 25s to keep connection alive
   const heartbeat = setInterval(() => {
     try { res.write(": heartbeat\n\n"); } catch { clearInterval(heartbeat); }
   }, 25000);
@@ -172,9 +194,9 @@ app.get("/events", (req, res) => {
   });
 });
 
-// ─── API: Get all leads (for page load fallback) ───────────────────────────
+// ─── API: Get all leads ────────────────────────────────────────────────────
 app.get("/api/leads", (req, res) => {
-  res.json({ leads, closers: CLOSERS });
+  res.json({ leads, closers: CLOSERS, outboundCount: loadOutboundCount() });
 });
 
 // ─── API: Assign setter/closer to lead ──────────────────────────────────────
@@ -189,10 +211,12 @@ app.post("/api/assign-setter/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── API: Manual call mark (fallback if GHL auto-detect isn't wired yet) ───
+// ─── API: Manual call mark ─────────────────────────────────────────────────
 app.post("/api/mark-called/:id", (req, res) => {
   const lead = leads.find((l) => l.id === req.params.id);
   if (lead && !lead.called) {
+    const outboundCount = incrementOutboundCount();
+    broadcast("outbound_update", { count: outboundCount });
     lead.called = true;
     lead.callTime = Math.round((Date.now() - lead.arrivedAt) / 1000);
     lead.calledAt = Date.now();
@@ -217,7 +241,7 @@ app.get("/api/daily-summary", (req, res) => {
   res.json({ entries: loadDailySummary() });
 });
 
-// ─── API: Clear all leads (admin) ──────────────────────────────────────────
+// ─── API: Clear all leads ──────────────────────────────────────────────────
 app.post("/api/clear", (req, res) => {
   leads = [];
   saveLeads();
@@ -263,18 +287,30 @@ function getDashboardHTML() {
     content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0; opacity: 0.3;
     background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
   }
-  .wrap { position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
-  header { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 40px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+  .wrap { position: relative; z-index: 1; max-width: 1200px; margin: 0 auto; padding: 28px 24px; }
+
+  /* Header — 3-column: logo | clock | controls */
+  header { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 24px; margin-bottom: 32px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
   .logo-eyebrow { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.2em; color: var(--muted); text-transform: uppercase; }
   .logo-title { font-family: 'Bebas Neue', sans-serif; font-size: 42px; letter-spacing: 0.05em; line-height: 1; }
   .logo-title span { color: var(--green); }
+  .header-center { text-align: center; }
+  .live-clock { font-family: 'Bebas Neue', sans-serif; font-size: 32px; letter-spacing: 0.04em; line-height: 1; color: var(--text); }
+  .live-date { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.1em; color: var(--muted); margin-top: 4px; }
+  .header-right { display: flex; align-items: center; gap: 12px; }
   .live-badge { display: flex; align-items: center; gap: 6px; font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.15em; color: var(--green); text-transform: uppercase; }
   .live-dot { width: 7px; height: 7px; background: var(--green); border-radius: 50%; animation: pulse 1.8s ease-in-out infinite; }
   @keyframes pulse { 0%,100%{opacity:1;transform:scale(1);box-shadow:0 0 0 0 rgba(0,230,118,.4)}50%{opacity:.7;transform:scale(1.1);box-shadow:0 0 0 5px rgba(0,230,118,0)} }
   .conn-dot-disconnected { background: var(--red) !important; animation: none !important; }
 
-  .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 32px; }
-  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; }
+  /* Control buttons (gear, fullscreen) */
+  .ctrl-btn { width: 34px; height: 34px; background: var(--surface); border: 1px solid var(--border); color: var(--muted); border-radius: 7px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+  .ctrl-btn:hover { border-color: var(--border-bright); color: var(--text); }
+  .ctrl-btn svg { display: block; }
+
+  /* Stats bar — 6 columns */
+  .stats-bar { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 28px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; }
   .stat-label { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
   .stat-value { font-family: 'Bebas Neue', sans-serif; font-size: 32px; letter-spacing: 0.04em; line-height: 1; }
   .stat-sub { font-family: 'DM Mono', monospace; font-size: 9px; color: var(--muted); margin-top: 2px; }
@@ -288,20 +324,41 @@ function getDashboardHTML() {
 
   .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
   .section-title { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.2em; color: var(--muted); text-transform: uppercase; }
-  .btn-clear { background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; padding: 5px 12px; border-radius: 5px; cursor: pointer; transition: all .2s; }
-  .btn-clear:hover { border-color: var(--red); color: var(--red); }
 
-  .leads-list { display: flex; flex-direction: column; gap: 10px; }
-  .lead-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 22px; display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 24px; animation: slideIn .35s ease; transition: border-color .2s; }
+  /* Lead cards — wallboard optimized, 2-column: info | timer */
+  .leads-list { display: flex; flex-direction: column; }
+  .lead-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 28px; display: grid; grid-template-columns: 1fr 180px;
+    align-items: center; gap: 24px; margin-bottom: 10px;
+    max-height: 150px; overflow: hidden;
+    transition: opacity 1s ease-out, max-height 1s ease-out, padding 1s ease-out, margin 1s ease-out, border-width 1s ease-out;
+  }
+  .lead-card.slide-in { animation: slideIn .35s ease; }
   @keyframes slideIn { from{opacity:0;transform:translateY(-12px)} to{opacity:1;transform:translateY(0)} }
   .lead-card.status-new { border-left: 3px solid var(--green); }
   .lead-card.status-warning { border-left: 3px solid var(--yellow); }
   .lead-card.status-urgent { border-left: 3px solid var(--orange); }
-  .lead-card.status-critical { border-left: 3px solid var(--red); animation: cardFlash 1.5s ease-in-out infinite; }
-  .lead-card.status-called { border-left: 3px solid #2a3040; opacity: 0.6; }
-  @keyframes cardFlash { 0%,100%{border-color:var(--red)}50%{border-color:rgba(255,23,68,.3)} }
+  .lead-card.status-critical {
+    border-left: 3px solid var(--red);
+    animation: criticalGlow 1.5s ease-in-out infinite;
+  }
+  @keyframes criticalGlow {
+    0%, 100% { box-shadow: 0 0 15px rgba(255,23,68,0.15), inset 0 0 15px rgba(255,23,68,0.03); border-left-color: var(--red); }
+    50% { box-shadow: 0 0 30px rgba(255,23,68,0.4), 0 0 60px rgba(255,23,68,0.12), inset 0 0 20px rgba(255,23,68,0.06); border-left-color: #ff5252; }
+  }
+  .lead-card.status-called { border-left: 3px solid #2a3040; opacity: 0.5; }
+  /* Auto-fade called leads after 60s */
+  .lead-card.lead-fading {
+    opacity: 0;
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    margin-bottom: 0;
+    border-width: 0;
+  }
 
-  .lead-name { font-weight: 500; font-size: 15px; margin-bottom: 5px; }
+  .lead-name { font-weight: 500; font-size: 16px; margin-bottom: 5px; }
   .lead-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .lead-phone { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); }
   .lead-timestamp { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--muted); margin-top: 4px; }
@@ -312,23 +369,13 @@ function getDashboardHTML() {
   .source-referral { color:#ffcc80; border-color:#3a2a10; background:rgba(255,204,128,.08); }
   .source-other { color:var(--muted); border-color:var(--border); }
 
-  .timer-display { font-family: 'Bebas Neue', sans-serif; font-size: 36px; letter-spacing: .05em; line-height: 1; min-width: 100px; text-align: center; }
-  .timer-label { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .15em; color: var(--muted); text-transform: uppercase; text-align: center; margin-top: 3px; }
+  /* Timer — larger, more dominant */
+  .timer-display { font-family: 'Bebas Neue', sans-serif; font-size: 52px; letter-spacing: .05em; line-height: 1; text-align: center; }
+  .timer-label { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .15em; color: var(--muted); text-transform: uppercase; text-align: center; margin-top: 4px; }
   .t-new{color:var(--green)} .t-warning{color:var(--yellow)} .t-urgent{color:var(--orange)}
   .t-critical{color:var(--red);animation:timerPulse .8s ease-in-out infinite}
-  .t-called{color:var(--muted);font-size:26px}
+  .t-called{color:var(--muted);font-size:34px}
   @keyframes timerPulse{0%,100%{opacity:1}50%{opacity:.4}}
-
-  /* Setter dropdown */
-  .setter-select { background: var(--bg); border: 1px solid var(--border-bright); color: var(--text); font-family: 'DM Mono', monospace; font-size: 10px; padding: 6px 10px; border-radius: 5px; cursor: pointer; margin-bottom: 8px; width: 100%; max-width: 160px; }
-  .setter-select:focus { border-color: var(--blue); outline: none; }
-  .setter-select option { background: var(--surface); color: var(--text); }
-  .setter-assigned { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--blue); margin-bottom: 4px; text-align: center; }
-
-  .btn-call { background: transparent; border: 1px solid var(--green); color: var(--green); font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .15em; text-transform: uppercase; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: all .2s; white-space: nowrap; }
-  .btn-call:hover { background: var(--green); color: #000; }
-  .btn-called { background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .15em; text-transform: uppercase; padding: 8px 16px; border-radius: 6px; cursor: default; white-space: nowrap; }
-  .call-time-result { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--muted); text-align: center; margin-top: 4px; }
 
   .empty-state { text-align: center; padding: 80px 24px; color: var(--muted); }
   .empty-icon { font-size: 48px; margin-bottom: 16px; opacity: .3; }
@@ -362,26 +409,42 @@ function getDashboardHTML() {
   .log-detail { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); }
   .log-time { font-family: 'Bebas Neue', sans-serif; font-size: 22px; }
 
-  .info-box { margin-top: 40px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 24px; }
-  .info-title { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .2em; color: var(--muted); text-transform: uppercase; margin-bottom: 14px; }
-  .endpoint-row { display: flex; align-items: center; gap: 10px; background: var(--bg); border: 1px solid var(--border-bright); border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; }
+  /* Settings panel (slide-out from right) */
+  .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 98; display: none; }
+  .settings-overlay.active { display: block; }
+  .settings-panel {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 420px; max-width: 90vw;
+    background: var(--bg); border-left: 1px solid var(--border); z-index: 99;
+    padding: 24px; transform: translateX(100%); transition: transform 0.3s ease;
+    overflow-y: auto;
+  }
+  .settings-panel.active { transform: translateX(0); }
+  .settings-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  .settings-title { font-family: 'DM Mono', monospace; font-size: 11px; letter-spacing: 0.2em; color: var(--muted); text-transform: uppercase; }
+  .settings-section { margin-bottom: 24px; }
+  .settings-section .info-title { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: .2em; color: var(--muted); text-transform: uppercase; margin-bottom: 14px; }
+  .endpoint-row { display: flex; align-items: center; gap: 10px; background: var(--surface); border: 1px solid var(--border-bright); border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; }
   .ep-method { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .1em; color: var(--orange); background: rgba(255,109,0,.1); border: 1px solid rgba(255,109,0,.2); padding: 2px 7px; border-radius: 4px; flex-shrink: 0; }
-  .ep-path { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--blue); flex: 1; }
-  .ep-desc { font-family: 'DM Mono', monospace; font-size: 10px; color: var(--muted); }
+  .ep-path { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--blue); flex: 1; word-break: break-all; }
   .copy-btn { background: transparent; border: 1px solid var(--border-bright); color: var(--muted); font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; padding: 4px 10px; border-radius: 4px; cursor: pointer; transition: all .2s; flex-shrink: 0; }
   .copy-btn:hover { border-color: var(--blue); color: var(--blue); }
-
-  .sim-bar { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .sim-label { font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .15em; color: var(--muted); text-transform: uppercase; }
+  .sim-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .btn-sim { background: transparent; border: 1px solid var(--border-bright); color: var(--text); font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; padding: 6px 13px; border-radius: 5px; cursor: pointer; transition: all .2s; }
   .btn-sim:hover { border-color: var(--green); color: var(--green); }
   .btn-sim.fb { border-color:#1a3a4a; color:#4fc3f7; } .btn-sim.fb:hover { background:rgba(79,195,247,.08); }
   .btn-sim.gg { border-color:#1a3a22; color:#a5d6a7; } .btn-sim.gg:hover { background:rgba(165,214,167,.08); }
+  .btn-clear { background: transparent; border: 1px solid var(--border); color: var(--muted); font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; padding: 6px 14px; border-radius: 5px; cursor: pointer; transition: all .2s; }
+  .btn-clear:hover { border-color: var(--red); color: var(--red); }
 
-  @media(max-width:700px){
+  @media(max-width:900px){
+    .stats-bar{grid-template-columns:repeat(3,1fr)}
+  }
+  @media(max-width:600px){
     .stats-bar{grid-template-columns:repeat(2,1fr)}
     .lead-card{grid-template-columns:1fr;gap:12px}
     .log-entry{grid-template-columns:1fr;gap:8px}
+    header{grid-template-columns:1fr;gap:12px;text-align:center}
+    .header-right{justify-content:center}
   }
 </style>
 </head>
@@ -392,22 +455,71 @@ function getDashboardHTML() {
   &#9888; CRITICAL: <span id="flash-name"></span> has been waiting over 5 minutes!
 </div>
 
+<!-- Settings slide-out panel -->
+<div id="settings-overlay" class="settings-overlay" onclick="toggleSettings()"></div>
+<div id="settings-panel" class="settings-panel">
+  <div class="settings-header">
+    <span class="settings-title">Settings</span>
+    <button class="ctrl-btn" onclick="toggleSettings()" title="Close">&#10005;</button>
+  </div>
+  <div class="settings-section">
+    <div class="info-title">GHL Webhook Endpoints</div>
+    <div class="endpoint-row">
+      <span class="ep-method">POST</span>
+      <span class="ep-path" id="ep-lead">${"DOMAIN"}/webhook/lead-in</span>
+      <button class="copy-btn" onclick="copyEp('ep-lead')">Copy</button>
+    </div>
+    <div class="endpoint-row">
+      <span class="ep-method">POST</span>
+      <span class="ep-path" id="ep-call">${"DOMAIN"}/webhook/call-made</span>
+      <button class="copy-btn" onclick="copyEp('ep-call')">Copy</button>
+    </div>
+  </div>
+  <div class="settings-section">
+    <div class="info-title">Simulate</div>
+    <div class="sim-bar">
+      <button class="btn-sim fb" onclick="sim('Facebook')">+ Facebook</button>
+      <button class="btn-sim gg" onclick="sim('Google')">+ Google</button>
+      <button class="btn-sim" onclick="sim('Website')">+ Website</button>
+      <button class="btn-sim" onclick="sim('Referral')">+ Referral</button>
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn-sim" style="border-color:#1a3a22;color:#a5d6a7" onclick="simCall()">&#128222; Sim Call</button>
+    </div>
+  </div>
+  <div class="settings-section">
+    <div class="info-title">Data</div>
+    <button class="btn-clear" onclick="clearAll()">Clear All Leads</button>
+  </div>
+</div>
+
 <div class="wrap">
   <header>
     <div>
       <div class="logo-eyebrow">Rooftop Power Co</div>
       <div class="logo-title">Speed to <span>Lead</span></div>
     </div>
-    <div class="live-badge">
-      <div class="live-dot" id="conn-dot"></div>
-      <span id="conn-label">Connecting...</span>
+    <div class="header-center">
+      <div class="live-clock" id="live-clock"></div>
+      <div class="live-date" id="live-date"></div>
+    </div>
+    <div class="header-right">
+      <div class="live-badge">
+        <div class="live-dot" id="conn-dot"></div>
+        <span id="conn-label">Connecting...</span>
+      </div>
+      <button class="ctrl-btn" onclick="toggleSettings()" title="Settings">&#9881;</button>
+      <button class="ctrl-btn" id="fs-btn" onclick="toggleFullscreen()" title="Fullscreen">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"/></svg>
+      </button>
     </div>
   </header>
 
   <div class="stats-bar">
     <div class="stat-card"><div class="stat-label">Leads Today</div><div class="stat-value blue" id="s-total">0</div></div>
     <div class="stat-card"><div class="stat-label">Avg Speed</div><div class="stat-value green" id="s-avg">--</div></div>
-    <div class="stat-card"><div class="stat-label">Called</div><div class="stat-value green" id="s-called">0</div></div>
+    <div class="stat-card"><div class="stat-label">New Leads Called</div><div class="stat-value green" id="s-called">0</div></div>
+    <div class="stat-card"><div class="stat-label">Outbound Calls</div><div class="stat-value blue" id="s-outbound">0</div></div>
     <div class="stat-card"><div class="stat-label">Waiting</div><div class="stat-value red" id="s-waiting">0</div></div>
     <div class="stat-card"><div class="stat-label">Top Closer</div><div class="stat-value yellow" id="s-top">--</div><div class="stat-sub" id="s-top-name">&nbsp;</div></div>
   </div>
@@ -422,7 +534,6 @@ function getDashboardHTML() {
   <div id="tab-leads">
     <div class="section-head">
       <span class="section-title">Active Leads</span>
-      <button class="btn-clear" onclick="clearAll()">Clear All</button>
     </div>
     <div class="leads-list" id="leads-list"></div>
   </div>
@@ -439,30 +550,6 @@ function getDashboardHTML() {
     </div>
     <div id="call-log"></div>
   </div>
-
-  <div class="info-box">
-    <div class="info-title">GHL Webhook Endpoints</div>
-    <div class="endpoint-row">
-      <span class="ep-method">POST</span>
-      <span class="ep-path" id="ep-lead">${"DOMAIN"}/webhook/lead-in</span>
-      <span class="ep-desc">New lead created</span>
-      <button class="copy-btn" onclick="copyEp('ep-lead')">Copy</button>
-    </div>
-    <div class="endpoint-row">
-      <span class="ep-method">POST</span>
-      <span class="ep-path" id="ep-call">${"DOMAIN"}/webhook/call-made</span>
-      <span class="ep-desc">Outbound call placed</span>
-      <button class="copy-btn" onclick="copyEp('ep-call')">Copy</button>
-    </div>
-    <div class="sim-bar">
-      <span class="sim-label">Simulate:</span>
-      <button class="btn-sim fb" onclick="sim('Facebook')">+ Facebook</button>
-      <button class="btn-sim gg" onclick="sim('Google')">+ Google</button>
-      <button class="btn-sim" onclick="sim('Website')">+ Website</button>
-      <button class="btn-sim" onclick="sim('Referral')">+ Referral</button>
-      <button class="btn-sim" style="margin-left:auto;border-color:#1a3a22;color:#a5d6a7" onclick="simCall()">&#128222; Sim Call</button>
-    </div>
-  </div>
 </div>
 
 <script>
@@ -473,11 +560,27 @@ var es;
 var audioCtx;
 var criticalAlerted = {};
 var currentTab = 'leads';
+var outboundCount = 0;
 
 // Set domain in endpoint display
 var domain = window.location.origin;
 document.getElementById('ep-lead').textContent = domain + '/webhook/lead-in';
 document.getElementById('ep-call').textContent = domain + '/webhook/call-made';
+
+// ── Live Clock ─────────────────────────────────────────────────────────────
+var DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+var MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function updateClock() {
+  var now = new Date();
+  var h = now.getHours();
+  var m = String(now.getMinutes()).padStart(2, '0');
+  var s = String(now.getSeconds()).padStart(2, '0');
+  var ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  document.getElementById('live-clock').textContent = h + ':' + m + ':' + s + ' ' + ampm;
+  document.getElementById('live-date').textContent = DAYS[now.getDay()] + ', ' + MONTHS[now.getMonth()] + ' ' + now.getDate() + ', ' + now.getFullYear();
+}
+updateClock();
 
 // ── Audio ─────────────────────────────────────────────────────────────────
 function getAudioCtx() {
@@ -501,7 +604,6 @@ function playNewLeadSound() {
     gain1.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
     osc1.start(ctx.currentTime);
     osc1.stop(ctx.currentTime + 0.3);
-
     var osc2 = ctx.createOscillator();
     var gain2 = ctx.createGain();
     osc2.connect(gain2);
@@ -537,12 +639,36 @@ function playUrgentSound() {
 
 // ── Critical Flash ─────────────────────────────────────────────────────────
 function showCriticalFlash(lead) {
+  var name = leadDisplayName(lead);
   var flash = document.getElementById('critical-flash');
-  document.getElementById('flash-name').textContent = lead.firstName + ' ' + lead.lastName;
+  document.getElementById('flash-name').textContent = name;
   flash.classList.add('active');
   playUrgentSound();
   setTimeout(function() { flash.classList.remove('active'); }, 4000);
 }
+
+// ── Settings Panel ─────────────────────────────────────────────────────────
+function toggleSettings() {
+  document.getElementById('settings-panel').classList.toggle('active');
+  document.getElementById('settings-overlay').classList.toggle('active');
+}
+
+// ── Fullscreen ─────────────────────────────────────────────────────────────
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(function(){});
+  } else {
+    document.exitFullscreen();
+  }
+}
+document.addEventListener('fullscreenchange', function() {
+  var btn = document.getElementById('fs-btn');
+  if (document.fullscreenElement) {
+    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 2v3H2M11 2v3h3M5 14v-3H2M11 14v-3h3"/></svg>';
+  } else {
+    btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"/></svg>';
+  }
+});
 
 // ── Tab Management ─────────────────────────────────────────────────────────
 function switchTab(tab) {
@@ -567,7 +693,7 @@ function connect() {
     var data = JSON.parse(e.data);
     leads = data.leads || [];
     if (data.closers) CLOSERS = data.closers;
-    // Pre-populate critical set for leads already past 5 min
+    outboundCount = data.outboundCount || 0;
     leads.forEach(function(l) {
       if (!l.called && (Date.now() - l.arrivedAt) >= 300000) {
         criticalAlerted[l.id] = true;
@@ -592,6 +718,7 @@ function connect() {
     if (lead) {
       lead.called = true;
       lead.callTime = d.callTime;
+      lead.calledAt = Date.now();
       lead.setter = d.setter || lead.setter;
       render();
     }
@@ -602,8 +729,13 @@ function connect() {
     var lead = leads.find(function(l) { return l.id === d.id; });
     if (lead) {
       lead.setter = d.setter;
-      render();
     }
+  });
+
+  es.addEventListener('outbound_update', function(e) {
+    var d = JSON.parse(e.data);
+    outboundCount = d.count;
+    document.getElementById('s-outbound').textContent = outboundCount;
   });
 
   es.addEventListener('clear', function() {
@@ -669,13 +801,10 @@ function fmtTimeFull(iso) {
   h = h % 12 || 12;
   return h + ':' + min + ':' + sec + ' ' + ampm;
 }
-
-function makeCloserOptions(selected) {
-  var html = '<option value="">Assign closer...</option>';
-  for (var i = 0; i < CLOSERS.length; i++) {
-    html += '<option value="' + CLOSERS[i] + '"' + (CLOSERS[i] === selected ? ' selected' : '') + '>' + CLOSERS[i] + '</option>';
-  }
-  return html;
+function leadDisplayName(lead) {
+  var name = (lead.firstName + ' ' + lead.lastName).trim();
+  if (!name || name === 'Unknown') return 'New Lead';
+  return name;
 }
 
 // ── Tab Title Badge ────────────────────────────────────────────────────────
@@ -692,33 +821,64 @@ function render() {
     list.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128225;</div><div class="empty-text">Waiting for incoming leads</div></div>';
     updateStats(); updateTabTitle(); return;
   }
-  list.innerHTML = leads.map(function(lead) {
-    var el = lead.called ? lead.callTime : Math.round((Date.now() - lead.arrivedAt) / 1000);
-    var actionCol = '';
-    if (lead.called) {
-      actionCol = (lead.setter ? '<div class="setter-assigned">' + lead.setter + '</div>' : '') +
-        '<div class="btn-called">&#10003; Called</div>' +
-        '<div class="call-time-result">' + fmt(lead.callTime) + '</div>';
-    } else {
-      actionCol = '<select class="setter-select" onchange="assignSetter(\\'' + lead.id + '\\', this.value)">' + makeCloserOptions(lead.setter) + '</select>' +
-        '<button class="btn-call" onclick="manualCall(\\'' + lead.id + '\\')">Mark Called</button>';
+  // Filter out called leads older than 90s (already faded out)
+  var visible = leads.filter(function(lead) {
+    if (lead.called && lead.calledAt) {
+      var sinceCall = Math.round((Date.now() - lead.calledAt) / 1000);
+      if (sinceCall > 90) return false;
     }
-    return '<div class="lead-card ' + cStatus(el, lead.called) + '" id="c-' + lead.id + '">' +
-      '<div><div class="lead-name">' + lead.firstName + ' ' + lead.lastName + '</div>' +
+    return true;
+  });
+  if (!visible.length) {
+    list.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128225;</div><div class="empty-text">All leads have been called</div></div>';
+    updateStats(); updateTabTitle(); return;
+  }
+  list.innerHTML = visible.map(function(lead) {
+    var el = lead.called ? lead.callTime : Math.round((Date.now() - lead.arrivedAt) / 1000);
+    var name = leadDisplayName(lead);
+    var fadingClass = '';
+    if (lead.called && lead.calledAt) {
+      var sinceCall = Math.round((Date.now() - lead.calledAt) / 1000);
+      if (sinceCall >= 60) fadingClass = ' lead-fading';
+    }
+    var timerContent = '';
+    if (lead.called) {
+      timerContent = '<div class="timer-display t-called" id="t-' + lead.id + '">' + fmt(lead.callTime) + '</div>' +
+        '<div class="timer-label" id="tl-' + lead.id + '">Called</div>';
+    } else {
+      timerContent = '<div class="timer-display ' + tClass(el, false) + '" id="t-' + lead.id + '">' + fmt(el) + '</div>' +
+        '<div class="timer-label" id="tl-' + lead.id + '">' + tLabel(el, false) + '</div>';
+    }
+    return '<div class="lead-card slide-in ' + cStatus(el, lead.called) + fadingClass + '" id="c-' + lead.id + '">' +
+      '<div><div class="lead-name">' + name + '</div>' +
       '<div class="lead-meta"><span class="lead-phone">' + lead.phone + '</span>' +
       '<span class="source-pill ' + srcClass(lead.source) + '">' + lead.source + '</span></div>' +
       '<div class="lead-timestamp">Arrived ' + fmtTime(lead.arrivedAt) + '</div></div>' +
-      '<div><div class="timer-display ' + tClass(el, lead.called) + '" id="t-' + lead.id + '">' + fmt(el) + '</div>' +
-      '<div class="timer-label" id="tl-' + lead.id + '">' + tLabel(el, lead.called) + '</div></div>' +
-      '<div>' + actionCol + '</div></div>';
+      '<div>' + timerContent + '</div></div>';
   }).join('');
   updateStats();
   updateTabTitle();
 }
 
 function updateTimers() {
+  updateClock();
+  var needsRerender = false;
   leads.forEach(function(lead) {
-    if (lead.called) return;
+    // Auto-fade called leads after 60s
+    if (lead.called && lead.calledAt) {
+      var sinceCall = Math.round((Date.now() - lead.calledAt) / 1000);
+      if (sinceCall >= 60 && sinceCall < 92) {
+        var card = document.getElementById('c-' + lead.id);
+        if (card && !card.classList.contains('lead-fading')) {
+          card.classList.add('lead-fading');
+        }
+      }
+      if (sinceCall >= 92) {
+        var card = document.getElementById('c-' + lead.id);
+        if (card) needsRerender = true;
+      }
+      return;
+    }
     var el = Math.round((Date.now() - lead.arrivedAt) / 1000);
     // Check critical threshold (5 minutes)
     if (el >= 300 && !criticalAlerted[lead.id]) {
@@ -732,8 +892,10 @@ function updateTimers() {
     te.textContent = fmt(el);
     te.className = 'timer-display ' + tClass(el, false);
     tle.textContent = tLabel(el, false);
-    ce.className = 'lead-card ' + cStatus(el, false);
+    // Preserve slide-in class during status updates
+    ce.className = 'lead-card slide-in ' + cStatus(el, false);
   });
+  if (needsRerender) render();
   updateStats();
   updateTabTitle();
 }
@@ -748,6 +910,7 @@ function updateStats() {
   document.getElementById('s-total').textContent = leads.length;
   document.getElementById('s-called').textContent = called.length;
   document.getElementById('s-waiting').textContent = waiting.length;
+  document.getElementById('s-outbound').textContent = outboundCount;
   if (called.length) {
     var avg = Math.round(called.reduce(function(s,l) { return s + l.callTime; }, 0) / called.length);
     document.getElementById('s-avg').textContent = fmt(avg);
@@ -815,7 +978,7 @@ function renderLeaderboard() {
 
   var el = document.getElementById('leaderboard');
   if (!ranked.length && !inactive.length) {
-    el.innerHTML = '<div class="lb-wrap"><div class="lb-empty">No closer data yet. Assign closers to leads and mark them as called.</div></div>';
+    el.innerHTML = '<div class="lb-wrap"><div class="lb-empty">No closer data yet.</div></div>';
     return;
   }
 
@@ -835,7 +998,7 @@ function renderLeaderboard() {
   }
 
   for (var i = 0; i < inactive.length; i++) {
-    html += '<tr style="opacity:0.4"><td class="lb-rank">—</td>' +
+    html += '<tr style="opacity:0.4"><td class="lb-rank">&#8212;</td>' +
       '<td class="lb-name">' + inactive[i].name + '</td>' +
       '<td>' + inactive[i].assigned + ' assigned</td>' +
       '<td class="lb-avg">--</td><td>--</td></tr>';
@@ -870,18 +1033,6 @@ function fetchCallLog() {
 }
 
 // ── Actions ────────────────────────────────────────────────────────────────
-function assignSetter(id, setter) {
-  fetch('/api/assign-setter/' + id, {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ setter: setter })
-  });
-}
-
-function manualCall(id) {
-  fetch('/api/mark-called/' + id, { method: 'POST' });
-}
-
 function clearAll() {
   if (confirm('Clear all leads?')) fetch('/api/clear', { method: 'POST' });
 }
@@ -889,7 +1040,7 @@ function clearAll() {
 function copyEp(id) {
   var el = document.getElementById(id);
   navigator.clipboard.writeText(el.textContent).then(function() {
-    var btn = el.nextElementSibling.nextElementSibling;
+    var btn = el.nextElementSibling;
     btn.textContent = 'Copied!';
     setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
   });
