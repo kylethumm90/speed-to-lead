@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const { Pool } = require("pg");
 const app = express();
 
 app.use(express.json());
@@ -13,7 +14,98 @@ const CLOSERS = [
   "Closer 6", "Closer 7", "Closer 8", "Closer 9",
 ];
 
-// ─── Data Persistence (JSON file) ───────────────────────────────────────────
+// ─── PostgreSQL ─────────────────────────────────────────────────────────────
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+async function initDB() {
+  if (!pool) return;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leads (
+        id VARCHAR PRIMARY KEY,
+        first_name VARCHAR,
+        last_name VARCHAR,
+        phone VARCHAR,
+        source VARCHAR,
+        arrived_at BIGINT,
+        called BOOLEAN DEFAULT FALSE,
+        call_time INTEGER,
+        call_status VARCHAR,
+        setter_name VARCHAR,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS appointments (
+        id SERIAL PRIMARY KEY,
+        contact_id VARCHAR,
+        first_name VARCHAR,
+        last_name VARCHAR,
+        appointment_time VARCHAR,
+        calendar_name VARCHAR,
+        status VARCHAR,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS calls (
+        id SERIAL PRIMARY KEY,
+        contact_id VARCHAR,
+        call_status VARCHAR,
+        call_time INTEGER,
+        setter_name VARCHAR,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("[DB] Tables initialized");
+  } catch (err) {
+    console.error("[DB] Failed to initialize tables:", err.message);
+  }
+}
+
+function todayStart() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function dbRowToLead(row) {
+  return {
+    id: row.id,
+    firstName: row.first_name || "New Lead",
+    lastName: row.last_name || "",
+    phone: row.phone || "--",
+    source: row.source || "Other",
+    arrivedAt: Number(row.arrived_at),
+    called: row.called || false,
+    callTime: row.call_time || null,
+    callStatus: row.call_status || null,
+    setter: row.setter_name || null,
+    calledAt: row.called && row.call_time
+      ? Number(row.arrived_at) + row.call_time * 1000
+      : null,
+  };
+}
+
+function dbRowToAppointment(row) {
+  return {
+    id: row.id,
+    contactId: row.contact_id,
+    firstName: row.first_name || "",
+    lastName: row.last_name || "",
+    appointmentTime: row.appointment_time,
+    calendarName: row.calendar_name,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
+// ─── JSON File Persistence (fallback when no DATABASE_URL) ──────────────────
 const DATA_DIR = path.join(__dirname, "data");
 const LEADS_FILE = path.join(DATA_DIR, "leads.json");
 
@@ -21,7 +113,7 @@ function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-function loadLeads() {
+function loadLeadsFromFile() {
   ensureDataDir();
   try {
     if (fs.existsSync(LEADS_FILE)) {
@@ -33,7 +125,7 @@ function loadLeads() {
   return [];
 }
 
-function saveLeads() {
+function saveLeadsToFile() {
   ensureDataDir();
   try {
     fs.writeFileSync(LEADS_FILE, JSON.stringify(leads, null, 2));
@@ -47,7 +139,7 @@ function getDailySummaryPath() {
   return path.join(DATA_DIR, "summary-" + today + ".json");
 }
 
-function loadDailySummary() {
+function loadDailySummaryFromFile() {
   const file = getDailySummaryPath();
   try {
     if (fs.existsSync(file)) {
@@ -59,9 +151,9 @@ function loadDailySummary() {
   return [];
 }
 
-function appendToSummary(entry) {
+function appendToSummaryFile(entry) {
   ensureDataDir();
-  const entries = loadDailySummary();
+  const entries = loadDailySummaryFromFile();
   entries.push(entry);
   try {
     fs.writeFileSync(getDailySummaryPath(), JSON.stringify(entries, null, 2));
@@ -70,13 +162,12 @@ function appendToSummary(entry) {
   }
 }
 
-// ─── Outbound Call Counter ──────────────────────────────────────────────────
 function getOutboundCountPath() {
   const today = new Date().toISOString().split("T")[0];
   return path.join(DATA_DIR, "outbound-" + today + ".json");
 }
 
-function loadOutboundCount() {
+function loadOutboundCountFromFile() {
   const file = getOutboundCountPath();
   try {
     if (fs.existsSync(file)) {
@@ -86,18 +177,58 @@ function loadOutboundCount() {
   return 0;
 }
 
-function incrementOutboundCount() {
+function incrementOutboundCountFile() {
   ensureDataDir();
-  const count = loadOutboundCount() + 1;
+  const count = loadOutboundCountFromFile() + 1;
   try {
     fs.writeFileSync(getOutboundCountPath(), JSON.stringify({ count }));
   } catch (err) {}
   return count;
 }
 
-// ─── Lead store (loaded from disk) ──────────────────────────────────────────
-let leads = loadLeads();
+// ─── In-memory state (loaded from DB or file on startup) ────────────────────
+let leads = [];
+let appointments = [];
 let clients = []; // SSE subscribers
+
+async function loadTodaysData() {
+  if (pool) {
+    try {
+      const start = todayStart();
+      const leadsRes = await pool.query(
+        "SELECT * FROM leads WHERE arrived_at >= $1 ORDER BY arrived_at DESC LIMIT 100",
+        [start.getTime()]
+      );
+      leads = leadsRes.rows.map(dbRowToLead);
+      const aptsRes = await pool.query(
+        "SELECT * FROM appointments WHERE created_at >= $1 ORDER BY created_at DESC",
+        [start]
+      );
+      appointments = aptsRes.rows.map(dbRowToAppointment);
+      console.log("[DB] Loaded " + leads.length + " leads and " + appointments.length + " appointments for today");
+    } catch (err) {
+      console.error("[DB] Failed to load today's data, falling back to file:", err.message);
+      leads = loadLeadsFromFile();
+    }
+  } else {
+    leads = loadLeadsFromFile();
+  }
+}
+
+async function getOutboundCount() {
+  if (pool) {
+    try {
+      const res = await pool.query(
+        "SELECT COUNT(*) FROM calls WHERE created_at >= $1",
+        [todayStart()]
+      );
+      return parseInt(res.rows[0].count);
+    } catch (err) {
+      return loadOutboundCountFromFile();
+    }
+  }
+  return loadOutboundCountFromFile();
+}
 
 // ─── SSE: broadcast to all connected dashboard clients ──────────────────────
 function broadcast(eventName, data) {
@@ -113,7 +244,7 @@ function broadcast(eventName, data) {
 }
 
 // ─── WEBHOOK: New Lead (GHL fires this when a contact is created) ───────────
-app.post("/webhook/lead-in", (req, res) => {
+app.post("/webhook/lead-in", async (req, res) => {
   const body = req.body;
 
   const lead = {
@@ -130,9 +261,19 @@ app.post("/webhook/lead-in", (req, res) => {
 
   const exists = leads.find((l) => l.id === lead.id);
   if (!exists) {
+    if (pool) {
+      try {
+        await pool.query(
+          "INSERT INTO leads (id, first_name, last_name, phone, source, arrived_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
+          [lead.id, lead.firstName, lead.lastName, lead.phone, lead.source, lead.arrivedAt]
+        );
+      } catch (err) {
+        console.error("[DB] Failed to insert lead:", err.message);
+      }
+    }
     leads.unshift(lead);
     if (leads.length > 100) leads = leads.slice(0, 100);
-    saveLeads();
+    saveLeadsToFile();
     broadcast("lead_in", lead);
     console.log("[LEAD IN] " + lead.firstName + " " + lead.lastName + " — " + lead.source);
   }
@@ -141,22 +282,49 @@ app.post("/webhook/lead-in", (req, res) => {
 });
 
 // ─── WEBHOOK: Call Made (GHL fires this when an outbound call is placed) ────
-app.post("/webhook/call-made", (req, res) => {
-  // Always count every outbound call
-  const outboundCount = incrementOutboundCount();
-  broadcast("outbound_update", { count: outboundCount });
-
+app.post("/webhook/call-made", async (req, res) => {
   const body = req.body;
   const contactId = body.contact_id || body.id || body.contactId;
+  const callStatus = body.call_status || body.status || "connected";
 
   const lead = leads.find((l) => l.id === contactId);
+  const callTime = lead && !lead.called ? Math.round((Date.now() - lead.arrivedAt) / 1000) : null;
+  const setterName = lead ? (lead.setter || null) : null;
+
+  // Always insert into calls table (every outbound call)
+  if (pool) {
+    try {
+      await pool.query(
+        "INSERT INTO calls (contact_id, call_status, call_time, setter_name) VALUES ($1, $2, $3, $4)",
+        [contactId, callStatus, callTime, setterName]
+      );
+    } catch (err) {
+      console.error("[DB] Failed to insert call:", err.message);
+    }
+  }
+
+  // Get updated outbound count
+  const outboundCount = pool ? await getOutboundCount() : incrementOutboundCountFile();
+  broadcast("outbound_update", { count: outboundCount });
+
+  // Update lead if found and not already called
   if (lead && !lead.called) {
     lead.called = true;
-    lead.callTime = Math.round((Date.now() - lead.arrivedAt) / 1000);
-    lead.callStatus = body.call_status || body.status || "connected";
+    lead.callTime = callTime;
+    lead.callStatus = callStatus;
     lead.calledAt = Date.now();
-    saveLeads();
-    appendToSummary({
+    if (pool) {
+      try {
+        await pool.query(
+          "UPDATE leads SET called = true, call_time = $1, call_status = $2 WHERE id = $3",
+          [callTime, callStatus, contactId]
+        );
+      } catch (err) {
+        console.error("[DB] Failed to update lead:", err.message);
+      }
+    }
+    saveLeadsToFile();
+    appendToSummaryFile({
       leadId: lead.id,
       name: lead.firstName + " " + lead.lastName,
       setter: lead.setter || "Unassigned",
@@ -172,15 +340,48 @@ app.post("/webhook/call-made", (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── WEBHOOK: Appointment Booked ────────────────────────────────────────────
+app.post("/webhook/appointment-booked", async (req, res) => {
+  const body = req.body;
+  const apt = {
+    contactId: body.contact_id || body.id || body.contactId || null,
+    firstName: body.first_name || body.firstName || body.contact?.firstName || "",
+    lastName: body.last_name || body.lastName || body.contact?.lastName || "",
+    appointmentTime: body.appointment_time || body.start_time || body.selectedTimeslot || "",
+    calendarName: body.calendar_name || body.calendarName || body.calendar?.name || "",
+    status: body.status || body.appointment_status || "scheduled",
+  };
+
+  if (pool) {
+    try {
+      const result = await pool.query(
+        "INSERT INTO appointments (contact_id, first_name, last_name, appointment_time, calendar_name, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at",
+        [apt.contactId, apt.firstName, apt.lastName, apt.appointmentTime, apt.calendarName, apt.status]
+      );
+      apt.id = result.rows[0].id;
+      apt.createdAt = result.rows[0].created_at;
+    } catch (err) {
+      console.error("[DB] Failed to insert appointment:", err.message);
+    }
+  }
+
+  appointments.unshift(apt);
+  broadcast("appointment_booked", apt);
+  console.log("[APPOINTMENT] " + apt.firstName + " " + apt.lastName + " — " + apt.calendarName);
+
+  res.json({ ok: true });
+});
+
 // ─── SSE: Dashboard subscribes here for real-time updates ───────────────────
-app.get("/events", (req, res) => {
+app.get("/events", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.flushHeaders();
 
-  res.write("event: init\ndata: " + JSON.stringify({ leads, closers: CLOSERS, outboundCount: loadOutboundCount() }) + "\n\n");
+  const outboundCount = await getOutboundCount();
+  res.write("event: init\ndata: " + JSON.stringify({ leads, closers: CLOSERS, outboundCount }) + "\n\n");
 
   clients.push(res);
 
@@ -195,16 +396,24 @@ app.get("/events", (req, res) => {
 });
 
 // ─── API: Get all leads ────────────────────────────────────────────────────
-app.get("/api/leads", (req, res) => {
-  res.json({ leads, closers: CLOSERS, outboundCount: loadOutboundCount() });
+app.get("/api/leads", async (req, res) => {
+  const outboundCount = await getOutboundCount();
+  res.json({ leads, closers: CLOSERS, outboundCount });
 });
 
 // ─── API: Assign setter/closer to lead ──────────────────────────────────────
-app.post("/api/assign-setter/:id", (req, res) => {
+app.post("/api/assign-setter/:id", async (req, res) => {
   const lead = leads.find((l) => l.id === req.params.id);
   if (lead) {
     lead.setter = req.body.setter || null;
-    saveLeads();
+    if (pool) {
+      try {
+        await pool.query("UPDATE leads SET setter_name = $1 WHERE id = $2", [lead.setter, lead.id]);
+      } catch (err) {
+        console.error("[DB] Failed to update setter:", err.message);
+      }
+    }
+    saveLeadsToFile();
     broadcast("setter_assigned", { id: lead.id, setter: lead.setter });
     console.log("[ASSIGN] " + lead.firstName + " " + lead.lastName + " → " + (lead.setter || "Unassigned"));
   }
@@ -212,16 +421,30 @@ app.post("/api/assign-setter/:id", (req, res) => {
 });
 
 // ─── API: Manual call mark ─────────────────────────────────────────────────
-app.post("/api/mark-called/:id", (req, res) => {
+app.post("/api/mark-called/:id", async (req, res) => {
   const lead = leads.find((l) => l.id === req.params.id);
   if (lead && !lead.called) {
-    const outboundCount = incrementOutboundCount();
-    broadcast("outbound_update", { count: outboundCount });
     lead.called = true;
     lead.callTime = Math.round((Date.now() - lead.arrivedAt) / 1000);
     lead.calledAt = Date.now();
-    saveLeads();
-    appendToSummary({
+    if (pool) {
+      try {
+        await pool.query(
+          "INSERT INTO calls (contact_id, call_status, call_time, setter_name) VALUES ($1, $2, $3, $4)",
+          [lead.id, "manual", lead.callTime, lead.setter || null]
+        );
+        await pool.query(
+          "UPDATE leads SET called = true, call_time = $1, call_status = 'manual' WHERE id = $2",
+          [lead.callTime, lead.id]
+        );
+      } catch (err) {
+        console.error("[DB] Failed to mark called:", err.message);
+      }
+    }
+    const outboundCount = pool ? await getOutboundCount() : incrementOutboundCountFile();
+    broadcast("outbound_update", { count: outboundCount });
+    saveLeadsToFile();
+    appendToSummaryFile({
       leadId: lead.id,
       name: lead.firstName + " " + lead.lastName,
       setter: lead.setter || "Unassigned",
@@ -237,16 +460,99 @@ app.post("/api/mark-called/:id", (req, res) => {
 });
 
 // ─── API: Daily summary ────────────────────────────────────────────────────
-app.get("/api/daily-summary", (req, res) => {
-  res.json({ entries: loadDailySummary() });
+app.get("/api/daily-summary", async (req, res) => {
+  if (pool) {
+    try {
+      const result = await pool.query(
+        "SELECT c.contact_id, c.call_time, c.setter_name, c.created_at, l.first_name, l.last_name, l.source, l.arrived_at FROM calls c LEFT JOIN leads l ON c.contact_id = l.id WHERE c.created_at >= $1 AND c.call_time IS NOT NULL ORDER BY c.created_at ASC",
+        [todayStart()]
+      );
+      const entries = result.rows.map((row) => ({
+        leadId: row.contact_id,
+        name: ((row.first_name || "") + " " + (row.last_name || "")).trim() || "Unknown",
+        setter: row.setter_name || "Unassigned",
+        timeToCall: row.call_time,
+        calledAt: row.created_at.toISOString(),
+        arrivedAt: row.arrived_at ? new Date(Number(row.arrived_at)).toISOString() : null,
+        source: row.source || "",
+      }));
+      return res.json({ entries });
+    } catch (err) {
+      console.error("[DB] Failed to load daily summary:", err.message);
+    }
+  }
+  res.json({ entries: loadDailySummaryFromFile() });
 });
 
-// ─── API: Clear all leads ──────────────────────────────────────────────────
+// ─── API: Clear all leads (dashboard only — does NOT delete from database) ─
 app.post("/api/clear", (req, res) => {
   leads = [];
-  saveLeads();
+  saveLeadsToFile();
   broadcast("clear", {});
   res.json({ ok: true });
+});
+
+// ─── API: History — Leads ──────────────────────────────────────────────────
+app.get("/api/history/leads", async (req, res) => {
+  const days = parseInt(req.query.days) || 7;
+  if (!pool) return res.json({ leads: [], message: "Database not configured" });
+  try {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    const result = await pool.query(
+      "SELECT * FROM leads WHERE arrived_at >= $1 ORDER BY arrived_at DESC",
+      [since.getTime()]
+    );
+    res.json({ leads: result.rows.map(dbRowToLead) });
+  } catch (err) {
+    console.error("[DB] History leads error:", err.message);
+    res.status(500).json({ error: "Database query failed" });
+  }
+});
+
+// ─── API: History — Appointments ────────────────────────────────────────────
+app.get("/api/history/appointments", async (req, res) => {
+  const days = parseInt(req.query.days) || 7;
+  if (!pool) return res.json({ appointments: [], message: "Database not configured" });
+  try {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    const result = await pool.query(
+      "SELECT * FROM appointments WHERE created_at >= $1 ORDER BY created_at DESC",
+      [since]
+    );
+    res.json({ appointments: result.rows.map(dbRowToAppointment) });
+  } catch (err) {
+    console.error("[DB] History appointments error:", err.message);
+    res.status(500).json({ error: "Database query failed" });
+  }
+});
+
+// ─── API: All-time Stats ────────────────────────────────────────────────────
+app.get("/api/stats/all-time", async (req, res) => {
+  if (!pool) {
+    return res.json({
+      totalLeads: 0, totalAppointments: 0,
+      avgSpeedToLead: null, bestSpeedToLead: null,
+      message: "Database not configured",
+    });
+  }
+  try {
+    const [leadsRes, aptsRes, speedRes] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM leads"),
+      pool.query("SELECT COUNT(*) FROM appointments"),
+      pool.query("SELECT AVG(call_time) as avg_speed, MIN(call_time) as best_speed FROM leads WHERE called = true AND call_time IS NOT NULL"),
+    ]);
+    res.json({
+      totalLeads: parseInt(leadsRes.rows[0].count),
+      totalAppointments: parseInt(aptsRes.rows[0].count),
+      avgSpeedToLead: speedRes.rows[0].avg_speed ? Math.round(parseFloat(speedRes.rows[0].avg_speed)) : null,
+      bestSpeedToLead: speedRes.rows[0].best_speed ? parseInt(speedRes.rows[0].best_speed) : null,
+    });
+  } catch (err) {
+    console.error("[DB] All-time stats error:", err.message);
+    res.status(500).json({ error: "Database query failed" });
+  }
 });
 
 // ─── Serve the dashboard UI ────────────────────────────────────────────────
@@ -256,12 +562,24 @@ app.get("/", (req, res) => {
 
 // ─── Start ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Speed to Lead running on port " + PORT);
-  console.log("Webhook endpoints:");
-  console.log("  POST /webhook/lead-in");
-  console.log("  POST /webhook/call-made");
-  console.log("Data directory: " + DATA_DIR);
+
+async function boot() {
+  await initDB();
+  await loadTodaysData();
+  app.listen(PORT, () => {
+    console.log("Speed to Lead running on port " + PORT);
+    console.log("Webhook endpoints:");
+    console.log("  POST /webhook/lead-in");
+    console.log("  POST /webhook/call-made");
+    console.log("  POST /webhook/appointment-booked");
+    console.log("Database: " + (pool ? "PostgreSQL connected" : "JSON file fallback"));
+    console.log("Data directory: " + DATA_DIR);
+  });
+}
+
+boot().catch((err) => {
+  console.error("[BOOT] Fatal error:", err);
+  process.exit(1);
 });
 
 // ─── Dashboard HTML ────────────────────────────────────────────────────────
