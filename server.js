@@ -792,6 +792,11 @@ function getDashboardHTML() {
       <span class="ep-path" id="ep-call">${"DOMAIN"}/webhook/call-made</span>
       <button class="copy-btn" onclick="copyEp('ep-call')">Copy</button>
     </div>
+    <div class="endpoint-row">
+      <span class="ep-method">POST</span>
+      <span class="ep-path" id="ep-appt">${"DOMAIN"}/webhook/appointment-booked</span>
+      <button class="copy-btn" onclick="copyEp('ep-appt')">Copy</button>
+    </div>
   </div>
   <div class="settings-section">
     <div class="info-title">Simulate</div>
